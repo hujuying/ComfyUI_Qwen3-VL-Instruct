@@ -30,6 +30,7 @@ class Qwen3_VQA:
         return {
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
+                "text2": ("STRING", {"default": "", "multiline": True}),  # 新增第二个提示词输入框
                 "model": (
                     [
                         "Qwen3-VL-4B-Instruct-FP8",
@@ -93,6 +94,7 @@ class Qwen3_VQA:
     def inference(
         self,
         text,
+        text2,  # 新增：接收第二个提示词
         model,
         keep_model_loaded,
         temperature,
@@ -102,9 +104,13 @@ class Qwen3_VQA:
         seed,
         quantization,
         source_path=None,
-        image=None,  # add image parameter
+        image=None,
         attention="eager",
     ):
+        # 组合提示词：清洗空值后用逗号拼接
+        prompt_parts = [p.strip() for p in [text, text2] if p.strip()]
+        combined_text = ", ".join(prompt_parts) if prompt_parts else ""
+
         if seed != -1:
             torch.manual_seed(seed)
         model_id = f"qwen/{model}"
@@ -121,7 +127,7 @@ class Qwen3_VQA:
                 local_dir_use_symlinks=False,
             )
 
-        # If model_id or quantization changed, reload processor and model
+        # 模型加载逻辑（保持不变）
         if (
             self.current_model_id != model_id
             or self.current_quantization != quantization
@@ -168,6 +174,7 @@ class Qwen3_VQA:
             pil_image.save(temp_path)
 
         with torch.no_grad():
+            # 构建消息时使用组合后的提示词 combined_text
             if source_path:
                 messages = [
                     {
@@ -178,7 +185,7 @@ class Qwen3_VQA:
                         "role": "user",
                         "content": source_path
                         + [
-                            {"type": "text", "text": text},
+                            {"type": "text", "text": combined_text},
                         ],
                     },
                 ]
@@ -192,7 +199,7 @@ class Qwen3_VQA:
                         "role": "user",
                         "content": [
                             {"type": "image", "image": f"file://{temp_path}"},
-                            {"type": "text", "text": text},
+                            {"type": "text", "text": combined_text},
                         ],
                     },
                 ]
@@ -201,12 +208,12 @@ class Qwen3_VQA:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": text},
+                            {"type": "text", "text": combined_text},
                         ],
                     }
                 ]
 
-            # Preparation for inference
+            # 推理逻辑（保持不变）
             text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -219,7 +226,6 @@ class Qwen3_VQA:
                 return_tensors="pt",
             )
             inputs = inputs.to(self.device)
-            # Inference: Generation of the output
             generated_ids = self.model.generate(
                 **inputs, max_new_tokens=max_new_tokens, temperature=temperature
             )
@@ -235,14 +241,14 @@ class Qwen3_VQA:
             )
 
             if not keep_model_loaded:
-                del self.processor  # release processor memory
-                del self.model  # release model memory
-                self.processor = None  # set processor to None
-                self.model = None  # set model to None
+                del self.processor
+                del self.model
+                self.processor = None
+                self.model = None
                 self.current_model_id = None
                 self.current_quantization = None
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()  # release GPU memory
+                    torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
 
             return (result,)
