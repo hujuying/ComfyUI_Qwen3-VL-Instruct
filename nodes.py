@@ -1,5 +1,6 @@
 import os
 import torch
+import gc  # 新增：导入垃圾回收模块
 import folder_paths
 from torchvision.transforms import ToPILImage
 from transformers import (
@@ -25,12 +26,58 @@ class Qwen3_VQA:
         self.current_model_id = None  # Track the current model id
         self.current_quantization = None  # Track the current quantization
 
+    # 新增：模型资源清理方法
+    def clear_model_resources(self):
+        if self.model is not None or self.processor is not None:
+            print(f"\n[Qwen3_VQA] Starting model unload...")
+            
+            # 记录卸载前的显存使用
+            vram_before = 0
+            if torch.cuda.is_available():
+                vram_before = torch.cuda.memory_allocated(self.device) / 1024**2
+                print(f"[Qwen3_VQA] VRAM allocated before unload: {vram_before:.2f} MB")
+
+            # 将模型移至CPU（如果在GPU上）
+            try:
+                if self.model is not None:
+                    self.model.to('cpu')
+                print(f"[Qwen3_VQA] Model moved to CPU successfully")
+            except Exception as e:
+                print(f"[Qwen3_VQA] Warning: Could not move model to CPU: {e}")
+
+            # 删除模型和处理器引用
+            del self.model
+            del self.processor
+            self.model = None
+            self.processor = None
+            self.current_model_id = None
+            self.current_quantization = None
+            print(f"[Qwen3_VQA] Model references deleted")
+
+            # 强制垃圾回收
+            for i in range(3):
+                collected = gc.collect()
+                print(f"[Qwen3_VQA] GC pass {i+1}: collected {collected} objects")
+
+            # 清理CUDA缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # 确保缓存清理完成
+                vram_after = torch.cuda.memory_allocated(self.device) / 1024**2
+                print(f"[Qwen3_VQA] VRAM allocated after unload: {vram_after:.2f} MB")
+                print(f"[Qwen3_VQA] VRAM freed: {vram_before - vram_after:.2f} MB")
+
+            print(f"[Qwen3_VQA] Model unload complete\n")
+        else:
+            print(f"[Qwen3_VQA] No model resources to unload")
+
     @classmethod
     def INPUT_TYPES(s):
+        # 保持不变...
         return {
             "required": {
                 "text": ("STRING", {"default": "", "multiline": True}),
-                "text2": ("STRING", {"default": "", "multiline": True}),  # 新增第二个提示词输入框
+                "text2": ("STRING", {"default": "", "multiline": True}),
                 "model": (
                     [
                         "Qwen3-VL-4B-Instruct-FP8",
@@ -47,7 +94,7 @@ class Qwen3_VQA:
                 "quantization": (
                     ["none", "4bit", "8bit"],
                     {"default": "none"},
-                ),  # add quantization type selection
+                ),
                 "keep_model_loaded": ("BOOLEAN", {"default": False}),
                 "temperature": (
                     "FLOAT",
@@ -75,7 +122,7 @@ class Qwen3_VQA:
                         "step": 28 * 28,
                     },
                 ),
-                "seed": ("INT", {"default": -1}),  # add seed parameter, default is -1
+                "seed": ("INT", {"default": -1}),
                 "attention": (
                     [
                         "eager",
@@ -94,7 +141,7 @@ class Qwen3_VQA:
     def inference(
         self,
         text,
-        text2,  # 新增：接收第二个提示词
+        text2,
         model,
         keep_model_loaded,
         temperature,
@@ -107,7 +154,7 @@ class Qwen3_VQA:
         image=None,
         attention="eager",
     ):
-        # 组合提示词：清洗空值后用逗号拼接
+        # 组合提示词逻辑保持不变
         prompt_parts = [p.strip() for p in [text, text2] if p.strip()]
         combined_text = ", ".join(prompt_parts) if prompt_parts else ""
 
@@ -118,6 +165,7 @@ class Qwen3_VQA:
             folder_paths.models_dir, "prompt_generator", os.path.basename(model_id)
         )
 
+        # 模型下载逻辑保持不变
         if not os.path.exists(self.model_checkpoint):
             from huggingface_hub import snapshot_download
 
@@ -127,35 +175,27 @@ class Qwen3_VQA:
                 local_dir_use_symlinks=False,
             )
 
-        # 模型加载逻辑（保持不变）
+        # 模型加载逻辑保持不变
         if (
             self.current_model_id != model_id
             or self.current_quantization != quantization
             or self.processor is None
             or self.model is None
         ):
+            # 加载新模型前先清理旧模型
+            self.clear_model_resources()
+            
             self.current_model_id = model_id
             self.current_quantization = quantization
-            if self.processor is not None:
-                del self.processor
-                self.processor = None
-            if self.model is not None:
-                del self.model
-                self.model = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
             self.processor = AutoProcessor.from_pretrained(
                 self.model_checkpoint, min_pixels=min_pixels, max_pixels=max_pixels
             )
+            
+            # 量化配置逻辑保持不变
             if quantization == "4bit":
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                )
+                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
             elif quantization == "8bit":
-                quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                )
+                quantization_config = BitsAndBytesConfig(load_in_8bit=True)
             else:
                 quantization_config = None
 
@@ -167,14 +207,15 @@ class Qwen3_VQA:
                 quantization_config=quantization_config,
             )
 
+        # 图像处理逻辑保持不变
         temp_path = None
         if image is not None:
             pil_image = ToPILImage()(image[0].permute(2, 0, 1))
             temp_path = Path(folder_paths.temp_directory) / f"temp_image_{seed}.png"
             pil_image.save(temp_path)
 
+        # 推理逻辑保持不变
         with torch.no_grad():
-            # 构建消息时使用组合后的提示词 combined_text
             if source_path:
                 messages = [
                     {
@@ -184,9 +225,7 @@ class Qwen3_VQA:
                     {
                         "role": "user",
                         "content": source_path
-                        + [
-                            {"type": "text", "text": combined_text},
-                        ],
+                        + [{"type": "text", "text": combined_text}],
                     },
                 ]
             elif temp_path:
@@ -207,13 +246,10 @@ class Qwen3_VQA:
                 messages = [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": combined_text},
-                        ],
+                        "content": [{"type": "text", "text": combined_text}],
                     }
                 ]
 
-            # 推理逻辑（保持不变）
             text = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
@@ -237,18 +273,10 @@ class Qwen3_VQA:
                 generated_ids_trimmed,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
-                temperature=temperature,
             )
 
-            if not keep_model_loaded:
-                del self.processor
-                del self.model
-                self.processor = None
-                self.model = None
-                self.current_model_id = None
-                self.current_quantization = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
+        # 修改：使用新的清理方法卸载模型
+        if not keep_model_loaded:
+            self.clear_model_resources()
 
-            return (result,)
+        return (result,)
